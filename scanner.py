@@ -17,8 +17,16 @@ parser.add_argument("-t", "--timeout", type=float, default=1.0)
 parser.add_argument("-w", "--workers", type=int, default=10)
 parser.add_argument("-o", "--output")
 parser.add_argument("--mode", choices=("sequential", "concurrent"), default="concurrent")
+parser.add_argument("--show-all", action="store_true", help="display closed and no-response ports as well")
 
 args = parser.parse_args()
+
+
+def should_display_status(status):
+    if args.show_all:
+        return True
+    return status in ("open", "error")
+
 
 # validation functions
 def handle_ports():
@@ -75,17 +83,39 @@ def connection(ip, port, timeout):
         "status": "",
         "error": None,
     }
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(timeout)
-        try:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
             s.connect((ip, port))
             result.update({"status": "open"})
-        except TimeoutError:
-            result.update({"status": "no_response"})
-        except ConnectionRefusedError:
-            result.update({"status": "closed"})
-        except OSError as e:
-            result.update({"status": "error", "error": str(e)})
+
+    except socket.timeout as e:
+        result.update({
+            "status": "no_response",
+            "error": {
+                "type": type(e).__name__,
+                "errno": e.errno,
+                "message": str(e)
+            }
+        })
+    except ConnectionRefusedError as e:
+        result.update({
+            "status": "closed",
+            "error": {
+                "type": type(e).__name__,
+                "errno": e.errno,
+                "message": str(e)
+            }
+        })
+    except OSError as e:
+        result.update({
+            "status": "error",
+            "error": {
+                "type": type(e).__name__,
+                "errno": e.errno,
+                "message": str(e)
+            }
+        })
     return result
 
 #sequental scanning
@@ -117,18 +147,21 @@ def summarize_results(scan_results, elapsed_ms):
         statistics["Ports Scanned"] += 1
         status = str(result.get("status", "")).strip().lower()
         port = result.get("port")
+        error = result.get("error")
+
+        display_ports[port] = {
+            "status": status,
+            "error": error,
+        }
 
         if status == "open":
             statistics["Open Ports"] += 1
-            display_ports[port] = status
         elif status == "closed":
             statistics["Closed Ports"] += 1
         elif status == "no_response":
-            statistics["No response"] += 1
-            display_ports[port] = status
+            statistics["No Response"] += 1
         elif status == "error":
             statistics["Errors"] += 1
-            display_ports[port] = status
 
 # values
 target = args.target
@@ -162,7 +195,6 @@ if mode == "sequential" :
     start_time = time.perf_counter()
     scan_result = run_sequental(target, ports, timeout)
     end_time = time.perf_counter()
-
 else:
     start_time = time.perf_counter()
     scan_result = run_concurrent(target, ports, timeout, workers)
@@ -184,8 +216,16 @@ if output:
         file.write("\n" + "=" * 12 + " Results " + "=" * 12 + "\n\n")
         file.write("PORT" + " " * 10 + "STATUS\n")
         file.write("-"*20+"\n")
-        for port, status in display_ports.items():
-            file.write(f"{port:<13} {status}\n")
+        for port in sorted(display_ports):
+            result = display_ports[port]
+            status = result["status"]
+            error = result["error"]
+            if not should_display_status(status):
+                continue
+            file.write(f"{port:<13} {status}")
+            if status == "error" and error:
+                file.write(f": {error.get('message', str(error))}")
+            file.write("\n")
 else:
     print("\n" + "=" * 10 + " Statistics " + "=" * 10 + "\n")
     for key, value in statistics.items():
@@ -194,12 +234,14 @@ else:
     print("\n" + "=" * 12 + " Results " + "=" * 12 + "\n")
     print("PORT" + " " * 10 + "STATUS")
     print("-"*20)
-    for port, status in display_ports.items():
-        print(f"{port:<13} {status}")
+    for port in sorted(display_ports):
+        result = display_ports[port]
+        status = result["status"]
+        error = result["error"]
+        if not should_display_status(status):
+            continue
+        print(f"{port:<13} {status}", end="")
+        if status == "error" and error:
+            print(f": {error.get('message', str(error))}", end="")
+        print()
 
-
-
-
-# statistics["Start Time"] = start_time.strftime("%H:%M:%S")
-# statistics["End Time"] = end_time.strftime("%H:%M:%S")
-# statistics["Total Scan Time"] = f"{elapsed_ms:.2f} ms"
