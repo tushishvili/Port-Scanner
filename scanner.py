@@ -1,247 +1,146 @@
 import argparse
 import ipaddress
 import socket
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
-from datetime import datetime
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
+
+MAX_PORT = 65535
+DEFAULT_VISIBLE = {"open", "error"}
 
 
-display_ports = {}
-
-# Input Handling
-parser = argparse.ArgumentParser()
-
-parser.add_argument("target")
-parser.add_argument("-p", "--ports", default="1-1024")
-parser.add_argument("-t", "--timeout", type=float, default=1.0)
-parser.add_argument("-w", "--workers", type=int, default=10)
-parser.add_argument("-o", "--output")
-parser.add_argument("--mode", choices=("sequential", "concurrent"), default="concurrent")
-parser.add_argument("--show-all", action="store_true", help="display closed and no-response ports as well")
-
-args = parser.parse_args()
+@dataclass(frozen=True)
+class ScanResult:
+    port: int
+    status: str  # open | closed | no_response | error
+    error: str | None = None
 
 
-def should_display_status(status):
-    if args.show_all:
-        return True
-    return status in ("open", "error")
-
-
-# validation functions
-def handle_ports():
-    PORTS = []
+#validation
+def ipv4(value):
     try:
-        if "-" in args.ports:
-                start, end = args.ports.strip().split("-", 1)
-                start = int(start)
-                end = int(end)
-                if start>end:
-                    raise ValueError("start port must be lower than end port")
-                elif start<=0 or end<=0:
-                     parser.error("port number should be greater than 0")
-                elif start>65535 or end>65535:
-                     parser.error("Invalid Port Range")
-                PORTS = list(range(start, end+1))
-                return PORTS
-        
-        for value in args.ports.split(","):
-            value = value.strip()
-            if not value:
-                parser.error("Can't accept empty element")
-            port_value = int(value)
-            if port_value <= 0 or port_value > 65535:
-                parser.error(f"Invalid port: {value}")
-            if port_value not in PORTS:
-                PORTS.append(port_value)
+        return str(ipaddress.IPv4Address(value))
     except ValueError:
-        parser.error("Invalid format of ports")
-    return PORTS
+        raise argparse.ArgumentTypeError(f"invalid IPv4 address: {value!r}")
 
 
-def validate_ip(ip):
-    try:
-        ipaddress.IPv4Address(ip)
-        return True
-    except ValueError:
-        parser.error("Invalid Ip Address")
+def positive(number_type):
+    def parse(value):
+        try:
+            number = number_type(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"invalid number: {value!r}")
+        if number <= 0:
+            raise argparse.ArgumentTypeError("must be greater than 0")
+        return number
+    return parse
+
+#parsing
+def parse_ports(spec):
+    ports = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            raise argparse.ArgumentTypeError("empty element in port list")
+        try:
+            start, _, end = part.partition("-")
+            start = int(start)
+            end = int(end) if end else start
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"invalid port format: {part!r}")
+        if start > end:
+            raise argparse.ArgumentTypeError(f"range start is greater than end: {part!r}")
+        if start < 1 or end > MAX_PORT:
+            raise argparse.ArgumentTypeError(f"ports must be between 1 and {MAX_PORT}: {part!r}")
+        ports.update(range(start, end + 1))
+    return sorted(ports)
 
 
-def check_for_negative_parameters(timeout, workers):
-    if timeout<=0:
-        parser.error("timeout must be positive number")
-    if workers<=0:
-         parser.error("need to have more than 0 workers")
+def build_parser():
+    p = argparse.ArgumentParser(description="Simple TCP connect scanner")
+    p.add_argument("target", type=ipv4)
+    p.add_argument("-p", "--ports", type=parse_ports, default="1-1024")
+    p.add_argument("-t", "--timeout", type=positive(float), default=1.0)
+    p.add_argument("-w", "--workers", type=positive(int), default=100)
+    p.add_argument("-o", "--output")
+    p.add_argument("--mode", choices=("sequential", "concurrent"), default="concurrent")
+    p.add_argument("--show-all", action="store_true",
+                   help="display closed and no-response ports as well")
+    return p
 
 
-#scanning functions
-# Connection Part
-def connection(ip, port, timeout):
-    result = {
-        "ip": ip,
-        "port": port,
-        "status": "",
-        "error": None,
-    }
+#scanning
+def scan_port(ip, port, timeout):
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
             s.connect((ip, port))
-            result.update({"status": "open"})
-
+        return ScanResult(port, "open")
     except socket.timeout as e:
-        result.update({
-            "status": "no_response",
-            "error": {
-                "type": type(e).__name__,
-                "errno": e.errno,
-                "message": str(e)
-            }
-        })
+        return ScanResult(port, "no_response", str(e))
     except ConnectionRefusedError as e:
-        result.update({
-            "status": "closed",
-            "error": {
-                "type": type(e).__name__,
-                "errno": e.errno,
-                "message": str(e)
-            }
-        })
+        return ScanResult(port, "closed", str(e))
     except OSError as e:
-        result.update({
-            "status": "error",
-            "error": {
-                "type": type(e).__name__,
-                "errno": e.errno,
-                "message": str(e)
-            }
-        })
-    return result
+        return ScanResult(port, "error", str(e))
 
-#sequental scanning
-def run_sequental(ip, ports, timeout):
-    results = []
-    for port in ports:
-        results.append(connection(ip, port, timeout))
-    return results
 
-#concurrent scanning
-def run_concurrent(ip,ports,timeout, workers):
-    futures = []
-    results = []
-    #thread poolis sheqmna
+def scan(ip, ports, timeout, mode, workers):
+    def task(port):
+        return scan_port(ip, port, timeout)
+
+    if mode == "sequential":
+        return [task(p) for p in ports]
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        #yoveli threadistvis gadacema funqciis da future obieqtebis masivshi shenaxva
-        for port in ports:
-            future = executor.submit(connection, ip, port, timeout)
-            futures.append(future)
-        #ukve dasrulebuli taskebis gadatana masivshi
-        for future in as_completed(futures):
-            result = future.result()
-            results.append(result)
-    return results
-
-def summarize_results(scan_results, elapsed_ms):
-    statistics["Duration"] = f"{elapsed_ms:.2f} ms"
-    for result in scan_results:
-        statistics["Ports Scanned"] += 1
-        status = str(result.get("status", "")).strip().lower()
-        port = result.get("port")
-        error = result.get("error")
-
-        display_ports[port] = {
-            "status": status,
-            "error": error,
-        }
-
-        if status == "open":
-            statistics["Open Ports"] += 1
-        elif status == "closed":
-            statistics["Closed Ports"] += 1
-        elif status == "no_response":
-            statistics["No Response"] += 1
-        elif status == "error":
-            statistics["Errors"] += 1
-
-# values
-target = args.target
-timeout = args.timeout
-workers = args.workers
-output = args.output
-mode = args.mode 
-
-# validation of arguments
-validate_ip(target)
-ports = handle_ports()
-check_for_negative_parameters(timeout, workers)
+        return list(executor.map(task, ports))  # preserves port order
 
 
-statistics = {
-    "Target": target,
-    "Scan Type": "TCP Connect",
-    "Scan Mode": mode,
-    "Duration" : "",
-    "Ports Scanned": 0,
-    "Open Ports": 0,
-    "Closed Ports": 0,
-    "No Response": 0,
-    "Errors": 0,
-    "Time-Out": timeout,
-    "Workers": workers,
-}
+#reporting
+def build_report(stats, results, show_all):
+    lines = ["=" * 10 + " Statistics " + "=" * 10, ""]
+    lines += [f"{key}: {value}" for key, value in stats.items()]
+    lines += ["", "=" * 12 + " Results " + "=" * 12, "",
+              f"{'PORT':<14}STATUS", "-" * 20]
 
-#scanning
-if mode == "sequential" : 
-    start_time = time.perf_counter()
-    scan_result = run_sequental(target, ports, timeout)
-    end_time = time.perf_counter()
-else:
-    start_time = time.perf_counter()
-    scan_result = run_concurrent(target, ports, timeout, workers)
-    end_time = time.perf_counter()
-
-elapsed_ms = (end_time-start_time)*1000
-summarize_results(scan_result, elapsed_ms)
-
-# sort result array
-scan_result.sort(key=lambda r: r["port"])
-
-# Write the results if a file path was provided
-if output:
-    with open(output, "w", encoding="utf-8") as file:
-        file.write("=" * 10 + " Statistics " + "=" * 10 + "\n\n")
-        for key, value in statistics.items():
-            file.write(f"{key}: {value}\n")
-
-        file.write("\n" + "=" * 12 + " Results " + "=" * 12 + "\n\n")
-        file.write("PORT" + " " * 10 + "STATUS\n")
-        file.write("-"*20+"\n")
-        for port in sorted(display_ports):
-            result = display_ports[port]
-            status = result["status"]
-            error = result["error"]
-            if not should_display_status(status):
-                continue
-            file.write(f"{port:<13} {status}")
-            if status == "error" and error:
-                file.write(f": {error.get('message', str(error))}")
-            file.write("\n")
-else:
-    print("\n" + "=" * 10 + " Statistics " + "=" * 10 + "\n")
-    for key, value in statistics.items():
-        print(f"{key}: {value}")
-
-    print("\n" + "=" * 12 + " Results " + "=" * 12 + "\n")
-    print("PORT" + " " * 10 + "STATUS")
-    print("-"*20)
-    for port in sorted(display_ports):
-        result = display_ports[port]
-        status = result["status"]
-        error = result["error"]
-        if not should_display_status(status):
+    for r in results:
+        if not (show_all or r.status in DEFAULT_VISIBLE):
             continue
-        print(f"{port:<13} {status}", end="")
-        if status == "error" and error:
-            print(f": {error.get('message', str(error))}", end="")
-        print()
+        line = f"{r.port:<14}{r.status}"
+        if r.status == "error" and r.error:
+            line += f": {r.error}"
+        lines.append(line)
+    return "\n".join(lines) + "\n"
 
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+
+    start = time.perf_counter()
+    results = scan(args.target, args.ports, args.timeout, args.mode, args.workers)
+    elapsed_ms = (time.perf_counter() - start) * 1000
+
+    counts = Counter(r.status for r in results)
+    stats = {
+        "Target": args.target,
+        "Scan Type": "TCP Connect",
+        "Scan Mode": args.mode,
+        "Duration": f"{elapsed_ms:.2f} ms",
+        "Ports Scanned": len(results),
+        "Open Ports": counts["open"],
+        "Closed Ports": counts["closed"],
+        "No Response": counts["no_response"],
+        "Errors": counts["error"],
+        "Timeout": args.timeout,
+        "Workers": args.workers if args.mode == "concurrent" else 1,
+    }
+
+    report = build_report(stats, results, args.show_all)
+    if args.output:
+        Path(args.output).write_text(report, encoding="utf-8")
+    else:
+        print(report, end="")
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
